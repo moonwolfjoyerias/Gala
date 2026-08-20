@@ -21,6 +21,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -642,6 +643,214 @@ function AbonosAdmin({ ticket, onAgregarAbono, config }) {
     "Agregar"
   )));
 }
+function ImportarGoogleSheets({ grupos, guardarGrupo, config, guardarSheetsUrls, onCerrar }) {
+  const urlsGuardadas = config.sheetsUrls || {};
+  const [urlLideres, setUrlLideres] = useState(urlsGuardadas.lideres || "");
+  const [urlAcomp, setUrlAcomp] = useState(urlsGuardadas.acompanantes || "");
+  const [urlPagos, setUrlPagos] = useState(urlsGuardadas.pagos || "");
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState("");
+  const [plan, setPlan] = useState(null);
+  const [resultado, setResultado] = useState(null);
+  const mapTipo = (raw) => {
+    const t = String(raw || "").trim().toLowerCase();
+    return t.startsWith("emprend") ? "abono_mayoreo" : "abono_publico";
+  };
+  const fetchCsv = async (url) => {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("No se pudo descargar uno de los links (revisa que sea p\xFAblico).");
+    const texto = await resp.text();
+    const wb = XLSX.read(texto, { type: "string" });
+    const hoja = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(hoja, { defval: "" });
+  };
+  const analizar = async () => {
+    setError("");
+    setPlan(null);
+    setResultado(null);
+    if (!urlLideres.trim() || !urlAcomp.trim() || !urlPagos.trim()) {
+      setError("Pega los 3 links antes de continuar.");
+      return;
+    }
+    setCargando(true);
+    try {
+      await guardarSheetsUrls({
+        lideres: urlLideres.trim(),
+        acompanantes: urlAcomp.trim(),
+        pagos: urlPagos.trim()
+      });
+      const [filasLideres, filasAcomp, filasPagos] = await Promise.all([
+        fetchCsv(urlLideres.trim()),
+        fetchCsv(urlAcomp.trim()),
+        fetchCsv(urlPagos.trim())
+      ]);
+      const gruposMap = new Map(grupos.map((g) => [g.id, JSON.parse(JSON.stringify(g))]));
+      const porCelular = new Map(grupos.map((g) => [g.celular, g.id]));
+      let lideresNuevas = 0;
+      let lideresActualizan = 0;
+      filasLideres.forEach((fila) => {
+        const nombre = String(fila["Nombre"] || "").trim();
+        const celular = normalizarCelular(String(fila["Celular"] || ""));
+        const tipo = mapTipo(fila["Tipo"]);
+        if (!nombre || celular.length !== 10) return;
+        if (porCelular.has(celular)) {
+          const g = gruposMap.get(porCelular.get(celular));
+          if (g.tickets[0].nombre !== nombre) {
+            g.tickets[0] = { ...g.tickets[0], nombre };
+            lideresActualizan++;
+          }
+        } else {
+          const nuevo = crearGrupo(nombre, celular, tipo);
+          gruposMap.set(nuevo.id, nuevo);
+          porCelular.set(celular, nuevo.id);
+          lideresNuevas++;
+        }
+      });
+      let acompNuevos = 0;
+      let acompActualizan = 0;
+      let acompError = 0;
+      filasAcomp.forEach((fila) => {
+        const nombre = String(fila["Nombre"] || "").trim();
+        const celular = normalizarCelular(String(fila["N\xFAmero de l\xEDder"] || ""));
+        const numero = String(fila["Acompa\xF1ante #"] || "").trim();
+        const tipo = mapTipo(fila["Tipo"]);
+        if (!nombre || !numero || !porCelular.has(celular)) {
+          acompError++;
+          return;
+        }
+        const g = gruposMap.get(porCelular.get(celular));
+        const existente = g.tickets.find((t) => !t.esLider && t.numeroImportado === numero);
+        if (existente) {
+          if (existente.nombre !== nombre) {
+            existente.nombre = nombre;
+            acompActualizan++;
+          }
+        } else {
+          const nuevo = crearBoleto(nombre, tipo, false);
+          nuevo.numeroImportado = numero;
+          g.tickets.push(nuevo);
+          acompNuevos++;
+        }
+      });
+      let pagosNuevos = 0;
+      let pagosDuplicados = 0;
+      let pagosError = 0;
+      for (const fila of filasPagos) {
+        const celular = normalizarCelular(String(fila["N\xFAmero de l\xEDder"] || ""));
+        const paraQuien = String(fila["\xBFPara qui\xE9n?"] || "").trim().toLowerCase();
+        const monto = Number(fila["Monto"]);
+        let fecha = fila["Fecha"];
+        if (fecha instanceof Date) fecha = fecha.toISOString().slice(0, 10);
+        fecha = String(fecha || "").trim();
+        if (!porCelular.has(celular) || !monto || monto <= 0 || !fecha) {
+          pagosError++;
+          continue;
+        }
+        const g = gruposMap.get(porCelular.get(celular));
+        const ticket = paraQuien === "l\xEDder" || paraQuien === "lider" ? g.tickets[0] : g.tickets.find((t) => !t.esLider && t.numeroImportado === paraQuien);
+        if (!ticket) {
+          pagosError++;
+          continue;
+        }
+        const yaExiste = (ticket.historialAbonos || []).some(
+          (a) => Number(a.monto) === monto && a.fecha === fecha
+        );
+        if (yaExiste) {
+          pagosDuplicados++;
+          continue;
+        }
+        const folioPago = await siguienteFolioPago();
+        const montoPorSello = TIPOS_BOLETO[ticket.tipo].montoPago;
+        ticket.pagos = distribuirAbono(ticket.pagos, montoPorSello, monto, fecha, folioPago);
+        ticket.historialAbonos = [...ticket.historialAbonos || [], { monto, fecha, folio: folioPago }];
+        if (!ticket.folio && ticket.pagos.every((p) => p.pagado)) {
+          ticket.folio = await siguienteFolioTicket();
+        }
+        pagosNuevos++;
+      }
+      setPlan({
+        lideresNuevas,
+        lideresActualizan,
+        acompNuevos,
+        acompActualizan,
+        acompError,
+        pagosNuevos,
+        pagosDuplicados,
+        pagosError,
+        gruposMap
+      });
+    } catch (e) {
+      setError(
+        "No pude leer los links. Confirma que cada hoja est\xE9 compartida como 'Cualquiera con el link puede ver' y que el link sea de exportaci\xF3n CSV. (" + e.message + ")"
+      );
+    }
+    setCargando(false);
+  };
+  const confirmar = async () => {
+    if (!plan) return;
+    setCargando(true);
+    for (const grupo of plan.gruposMap.values()) {
+      await guardarGrupo(grupo);
+    }
+    setCargando(false);
+    setResultado({
+      lideres: plan.lideresNuevas + plan.lideresActualizan,
+      acompanantes: plan.acompNuevos + plan.acompActualizan,
+      pagos: plan.pagosNuevos
+    });
+    setPlan(null);
+  };
+  return /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("p", { className: "font-body font-medium text-[#5E1A8A]" }, "Importar desde Google Sheets"), /* @__PURE__ */ React.createElement("button", { onClick: onCerrar, className: "text-[#5E1A8A]/50 hover:text-red-500", "aria-label": "Cerrar" }, /* @__PURE__ */ React.createElement(X, { className: "w-4 h-4" }))), !plan && !resultado && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-[#5E1A8A]/70 mb-3" }, 'Pega los 3 links de exportaci\xF3n CSV (Archivo \u2192 Compartir \u2192 Publicar en la web, o el link de "Cualquiera con el link puede ver"), uno por cada hoja.'), /* @__PURE__ */ React.createElement("div", { className: "space-y-2 mb-3" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: urlLideres,
+      onChange: (e) => setUrlLideres(e.target.value),
+      placeholder: "Link de la hoja L\xEDderes",
+      className: "w-full font-body text-sm bg-white border border-[#E5DFD5] rounded-lg px-3 py-2 focus:outline-none focus:border-[#5E1A8A]"
+    }
+  ), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: urlAcomp,
+      onChange: (e) => setUrlAcomp(e.target.value),
+      placeholder: "Link de la hoja Acompa\xF1antes",
+      className: "w-full font-body text-sm bg-white border border-[#E5DFD5] rounded-lg px-3 py-2 focus:outline-none focus:border-[#5E1A8A]"
+    }
+  ), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: urlPagos,
+      onChange: (e) => setUrlPagos(e.target.value),
+      placeholder: "Link de la hoja Pagos",
+      className: "w-full font-body text-sm bg-white border border-[#E5DFD5] rounded-lg px-3 py-2 focus:outline-none focus:border-[#5E1A8A]"
+    }
+  )), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: analizar,
+      disabled: cargando,
+      className: "w-full text-white rounded-xl py-2.5 font-body font-medium disabled:opacity-50",
+      style: { backgroundColor: "#5E1A8A" }
+    },
+    cargando ? "Leyendo\u2026" : "Analizar"
+  ), error && /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-red-500 mt-2" }, error)), plan && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-3 gap-2 mb-3 text-center" }, /* @__PURE__ */ React.createElement("div", { className: "rounded-lg p-2", style: { backgroundColor: "#F8F4EF" } }, /* @__PURE__ */ React.createElement("p", { className: "font-display text-lg text-[#5E1A8A] font-semibold" }, plan.lideresNuevas + plan.lideresActualizan), /* @__PURE__ */ React.createElement("p", { className: "font-body text-[10px] text-[#5E1A8A]/70" }, "L\xEDderes (", plan.lideresNuevas, " nuevas)")), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg p-2", style: { backgroundColor: "#F8F4EF" } }, /* @__PURE__ */ React.createElement("p", { className: "font-display text-lg text-[#5E1A8A] font-semibold" }, plan.acompNuevos + plan.acompActualizan), /* @__PURE__ */ React.createElement("p", { className: "font-body text-[10px] text-[#5E1A8A]/70" }, "Acompa\xF1antes (", plan.acompError, " con error)")), /* @__PURE__ */ React.createElement("div", { className: "rounded-lg p-2", style: { backgroundColor: "#F8F4EF" } }, /* @__PURE__ */ React.createElement("p", { className: "font-display text-lg text-[#5E1A8A] font-semibold" }, plan.pagosNuevos), /* @__PURE__ */ React.createElement("p", { className: "font-body text-[10px] text-[#5E1A8A]/70" }, "Pagos (", plan.pagosDuplicados, " ya exist\xEDan, ", plan.pagosError, " con error)"))), /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-[#5E1A8A]/60 mb-3" }, 'Nota: los folios de los pagos nuevos ya quedaron asignados en este an\xE1lisis. Si cancelas, esos n\xFAmeros de folio no se reutilizan (quedan "saltados"), pero eso no causa ning\xFAn problema.'), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2" }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: confirmar,
+      disabled: cargando,
+      className: "flex-1 text-white rounded-xl py-2.5 font-body font-medium disabled:opacity-50",
+      style: { backgroundColor: "#5E1A8A" }
+    },
+    cargando ? "Guardando\u2026" : "Confirmar e importar"
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => setPlan(null),
+      className: "px-4 rounded-xl border border-[#5E1A8A]/30 text-[#5E1A8A] font-body text-sm"
+    },
+    "Cancelar"
+  ))), resultado && /* @__PURE__ */ React.createElement("div", { className: "rounded-xl p-4 text-center", style: { backgroundColor: "#F8F4EF" } }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]" }, "Listo: ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, resultado.lideres), " l\xEDderes,", " ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, resultado.acompanantes), " acompa\xF1antes y", " ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, resultado.pagos), " pagos importados.")));
+}
 function TarjetaGrupoAdmin({ grupo, onCambiar, onEliminarGrupo, config }) {
   const [mostrarAgregar, setMostrarAgregar] = useState(false);
   const [nombreAcomp, setNombreAcomp] = useState("");
@@ -808,13 +1017,14 @@ function TarjetaGrupoAdmin({ grupo, onCambiar, onEliminarGrupo, config }) {
     " Agregar acompa\xF1ante"
   ));
 }
-function VistaEquipo({ config, guardarEvento, guardarPeriodos, grupos, guardarGrupo, borrarGrupo, onSalir }) {
+function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls, grupos, guardarGrupo, borrarGrupo, onSalir }) {
   const [tab, setTab] = useState("resumen");
   const [nuevoNombre, setNuevoNombre] = useState("");
   const [nuevoCelular, setNuevoCelular] = useState("");
   const [nuevoTipo, setNuevoTipo] = useState("parcialidades");
   const [filtro, setFiltro] = useState("");
   const [folioBuscado, setFolioBuscado] = useState("");
+  const [mostrarImportar, setMostrarImportar] = useState(false);
   const todosTickets = grupos.flatMap((g) => g.tickets);
   const completos = todosTickets.filter(boletoCompleto).length;
   const enProceso = todosTickets.length - completos;
@@ -880,7 +1090,23 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, grupos, guardarGr
     /* @__PURE__ */ React.createElement(t.icon, { className: "w-4 h-4" }),
     " ",
     t.label
-  ))), tab === "resumen" && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 sm:gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Grupos (l\xEDderes)"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, grupos.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos totales"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, todosTickets.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos completos"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#CB924F] font-semibold" }, completos)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "En proceso"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, enProceso)), /* @__PURE__ */ React.createElement("div", { className: "col-span-2 bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Recaudado"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-3xl text-[#5E1A8A] font-semibold" }, "$", recaudado.toLocaleString("es-MX"), " MXN"))), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5 mb-4" }, /* @__PURE__ */ React.createElement("p", { className: "font-body font-medium text-[#5E1A8A] mb-3" }, "Registrar nueva l\xEDder"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row gap-2" }, /* @__PURE__ */ React.createElement(
+  ))), tab === "resumen" && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 sm:gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Grupos (l\xEDderes)"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, grupos.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos totales"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, todosTickets.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos completos"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#CB924F] font-semibold" }, completos)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "En proceso"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, enProceso)), /* @__PURE__ */ React.createElement("div", { className: "col-span-2 bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Recaudado"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-3xl text-[#5E1A8A] font-semibold" }, "$", recaudado.toLocaleString("es-MX"), " MXN"))), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-end mb-3" }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => setMostrarImportar(!mostrarImportar),
+      className: "font-body text-sm text-[#5E1A8A] border border-[#5E1A8A]/30 rounded-full px-4 py-1.5"
+    },
+    mostrarImportar ? "Ocultar importador" : "\u{1F4E5} Importar desde Google Sheets"
+  )), mostrarImportar && /* @__PURE__ */ React.createElement(
+    ImportarGoogleSheets,
+    {
+      grupos,
+      guardarGrupo,
+      config,
+      guardarSheetsUrls,
+      onCerrar: () => setMostrarImportar(false)
+    }
+  ), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5 mb-4" }, /* @__PURE__ */ React.createElement("p", { className: "font-body font-medium text-[#5E1A8A] mb-3" }, "Registrar nueva l\xEDder"), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-2" }, /* @__PURE__ */ React.createElement("div", { className: "flex flex-col sm:flex-row gap-2" }, /* @__PURE__ */ React.createElement(
     "input",
     {
       value: nuevoNombre,
@@ -1052,10 +1278,11 @@ async function migrarSiNecesario() {
 }
 async function cargarConfig() {
   await migrarSiNecesario();
-  const [eDoc, pDoc, cDoc] = await Promise.all([
+  const [eDoc, pDoc, cDoc, sDoc] = await Promise.all([
     db.collection("mwGalaConfig").doc("evento").get(),
     db.collection("mwGalaConfig").doc("periodos").get(),
-    db.collection("mwGalaConfig").doc("contadores").get()
+    db.collection("mwGalaConfig").doc("contadores").get(),
+    db.collection("mwGalaConfig").doc("sheetsUrls").get()
   ]);
   const config = { folioContador: 0, folioPagoContador: 0 };
   if (eDoc.exists) config.evento = eDoc.data();
@@ -1065,6 +1292,7 @@ async function cargarConfig() {
     config.folioContador = d.folioContador || 0;
     config.folioPagoContador = d.folioPagoContador || 0;
   }
+  if (sDoc.exists) config.sheetsUrls = sDoc.data();
   return config;
 }
 async function guardarEventoStorage(evento) {
@@ -1072,6 +1300,9 @@ async function guardarEventoStorage(evento) {
 }
 async function guardarPeriodosStorage(periodos) {
   await db.collection("mwGalaConfig").doc("periodos").set({ lista: periodos });
+}
+async function guardarSheetsUrlsStorage(urls) {
+  await db.collection("mwGalaConfig").doc("sheetsUrls").set(urls);
 }
 async function siguienteContadorCampo(campo) {
   const ref = db.collection("mwGalaConfig").doc("contadores");
@@ -1135,6 +1366,13 @@ function App() {
     } catch (e) {
     }
   }, []);
+  const guardarSheetsUrls = useCallback(async (urls) => {
+    setConfigState((prev) => ({ ...prev, sheetsUrls: urls }));
+    try {
+      await guardarSheetsUrlsStorage(urls);
+    } catch (e) {
+    }
+  }, []);
   const guardarGrupo = useCallback(async (grupo) => {
     setGruposState((prev) => {
       const existe = prev.some((g) => g.id === grupo.id);
@@ -1183,6 +1421,7 @@ function App() {
       config,
       guardarEvento,
       guardarPeriodos,
+      guardarSheetsUrls,
       grupos,
       guardarGrupo,
       borrarGrupo,
