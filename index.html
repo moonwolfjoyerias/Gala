@@ -249,7 +249,7 @@ function Sello({ pago, index, fechaVencimiento, libre, montoPorSello }) {
       }
     },
     activo ? /* @__PURE__ */ React.createElement("img", { src: LOGO_ICON_WHITE, alt: "", className: "w-8 h-8 sm:w-9 sm:h-9 object-contain" }) : /* @__PURE__ */ React.createElement(Gem, { className: "w-5 h-5 text-[#1E1E1E]" })
-  ), /* @__PURE__ */ React.createElement("span", { className: "font-body text-[10px] sm:text-[11px] text-[#5E1A8A]/70 text-center leading-tight" }, "Pago ", index + 1, /* @__PURE__ */ React.createElement("br", null), activo ? pago.fecha ? `Pagado: ${pago.fecha}` : "Pagado" : libre ? `Faltan $${faltanteSello.toLocaleString("es-MX")}` : `Vence: ${fechaVencimiento}`));
+  ), /* @__PURE__ */ React.createElement("span", { className: "font-body text-[10px] sm:text-[11px] text-[#5E1A8A]/70 text-center leading-tight" }, "Pago ", index + 1, /* @__PURE__ */ React.createElement("br", null), activo ? pago.fecha ? `Pagado: ${pago.fecha}` : "Pagado" : libre ? `Faltan $${faltanteSello.toLocaleString("es-MX")}` : ``));
 }
 function ComoConseguirBoleto() {
   return /* @__PURE__ */ React.createElement(PanelDesplegable, { icono: Ticket, titulo: "\xBFC\xF3mo consigo mi boleto?" }, /* @__PURE__ */ React.createElement("div", { className: "space-y-4" }, /* @__PURE__ */ React.createElement(
