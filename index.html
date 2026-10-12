@@ -25,6 +25,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 </head>
 <body>
 <div id="root"></div>
@@ -401,6 +402,208 @@ function dibujarBoletoEnCanvas(canvas, ticket, nombreGrupo, evento) {
   ctx.textAlign = "right";
   ctx.fillText(`Folio ${ticket.folio || "\u2014"}`, W - 40, H - 28);
   ctx.textAlign = "left";
+}
+function gruposConBoletosCompletos(grupos) {
+  return grupos.map((g) => ({
+    grupo: g,
+    lider: g.tickets[0],
+    completos: g.tickets.filter(boletoCompleto)
+  })).filter((x) => x.completos.length > 0).sort((a, b) => a.lider.nombre.localeCompare(b.lider.nombre, "es"));
+}
+function cargarLogoBlanco() {
+  return new Promise((resolve) => {
+    let img = window.__mwLogoIconWhite;
+    if (img && img.complete) return resolve();
+    if (!img) {
+      img = new Image();
+      img.src = LOGO_ICON_WHITE;
+      window.__mwLogoIconWhite = img;
+    }
+    img.addEventListener("load", () => resolve(), { once: true });
+    img.addEventListener("error", () => resolve(), { once: true });
+    setTimeout(resolve, 4e3);
+  });
+}
+function nombreArchivoFecha(base) {
+  return `${base}-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.pdf`;
+}
+function descargarListaBoletosCompletos(grupos) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "mm", format: "letter" });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 16;
+  const sangria = 10;
+  const morado = [94, 26, 138];
+  const dorado = [203, 146, 79];
+  const gris = [130, 120, 140];
+  const lista = gruposConBoletosCompletos(grupos);
+  const totalBoletos = lista.reduce((s, x) => s + x.completos.length, 0);
+  const totalLideres = lista.filter((x) => boletoCompleto(x.lider)).length;
+  let y = M;
+  const encabezado = () => {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.setTextColor(...morado);
+    doc.text(`${EVENTO_NOMBRE} \xB7 Gala de Aniversario`, M, y + 4);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    doc.setTextColor(...dorado);
+    doc.text("Boletos completamente pagados", M, y + 10);
+    doc.setFontSize(9);
+    doc.setTextColor(...gris);
+    doc.text(`Generado el ${(/* @__PURE__ */ new Date()).toLocaleDateString("es-MX")} \xB7 ${totalBoletos} boleto(s): ${totalLideres} de l\xEDderes y ${totalBoletos - totalLideres} de acompa\xF1antes`, M, y + 15);
+    doc.setDrawColor(...dorado);
+    doc.setLineWidth(0.4);
+    doc.line(M, y + 18, W - M, y + 18);
+    y += 26;
+  };
+  const asegurarEspacio = (alto) => {
+    if (y + alto > H - M) {
+      doc.addPage();
+      y = M;
+    }
+  };
+  const recortar = (texto, ancho) => doc.splitTextToSize(texto, ancho)[0] + (doc.splitTextToSize(texto, ancho).length > 1 ? "…" : "");
+  encabezado();
+  if (lista.length === 0) {
+    doc.setFontSize(11);
+    doc.setTextColor(...gris);
+    doc.text("Todav\xEDa no hay boletos completamente pagados.", M, y);
+  }
+  lista.forEach(({ grupo, lider, completos }) => {
+    const acompanantes = completos.filter((t) => !t.esLider);
+    asegurarEspacio(8 + 6);
+    const liderPagado = boletoCompleto(lider);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(...(liderPagado ? morado : gris));
+    doc.text(recortar(lider.nombre, W - 2 * M - 70), M, y);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(...gris);
+    const cel = grupo.celular ? `Cel. ${grupo.celular}` : "Sin celular";
+    doc.text(liderPagado ? cel : `${cel} \xB7 boleto pendiente`, M, y + 4.5);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(...(liderPagado ? dorado : gris));
+    doc.text(liderPagado ? lider.folio || "Sin folio" : "—", W - M, y, { align: "right" });
+    y += 9;
+    acompanantes.forEach((t) => {
+      asegurarEspacio(6);
+      doc.setDrawColor(...dorado);
+      doc.setLineWidth(0.3);
+      doc.line(M + 3, y - 3.6, M + 3, y - 1.2);
+      doc.line(M + 3, y - 1.2, M + sangria - 2, y - 1.2);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(40, 30, 50);
+      doc.text(recortar(t.nombre, W - 2 * M - sangria - 40), M + sangria, y);
+      doc.setTextColor(...dorado);
+      doc.text(t.folio || "Sin folio", W - M, y, { align: "right" });
+      y += 6;
+    });
+    doc.setDrawColor(235, 228, 242);
+    doc.setLineWidth(0.2);
+    doc.line(M, y - 2, W - M, y - 2);
+    y += 3;
+  });
+  const paginas = doc.internal.getNumberOfPages();
+  for (let p = 1; p <= paginas; p++) {
+    doc.setPage(p);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(...gris);
+    doc.text(`P\xE1gina ${p} de ${paginas}`, W - M, H - 8, { align: "right" });
+  }
+  doc.save(nombreArchivoFecha("boletos-completos-lista"));
+}
+async function descargarBoletosImprimibles(grupos, evento) {
+  await cargarLogoBlanco();
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "mm", format: "letter" });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const gap = 6;
+  const margenX = 10;
+  const anchoBoleto = (W - 2 * margenX - gap) / 2;
+  const altoBoleto = anchoBoleto * 560 / 1e3;
+  const altoBloque = 4 * altoBoleto + 3 * gap;
+  const margenY = (H - altoBloque) / 2;
+  const boletos = [];
+  gruposConBoletosCompletos(grupos).forEach(({ lider, completos }) => {
+    completos.forEach((t) => boletos.push({ ticket: t, nombreGrupo: lider.nombre }));
+  });
+  if (boletos.length === 0) return false;
+  const canvas = document.createElement("canvas");
+  const guias = () => {
+    doc.setDrawColor(200, 200, 200);
+    doc.setLineWidth(0.2);
+    doc.setLineDashPattern([1.5, 1.5], 0);
+    doc.line(W / 2, margenY - 4, W / 2, margenY + altoBloque + 4);
+    for (let r = 1; r < 4; r++) {
+      const yy = margenY + r * altoBoleto + (r - 0.5) * gap;
+      doc.line(margenX - 4, yy, W - margenX + 4, yy);
+    }
+    doc.setLineDashPattern([], 0);
+  };
+  boletos.forEach(({ ticket, nombreGrupo }, i) => {
+    const pos = i % 8;
+    if (i > 0 && pos === 0) doc.addPage();
+    if (pos === 0) guias();
+    const col = pos % 2;
+    const fila = Math.floor(pos / 2);
+    dibujarBoletoEnCanvas(canvas, ticket, nombreGrupo, evento);
+    const img = canvas.toDataURL("image/jpeg", 0.92);
+    doc.addImage(img, "JPEG", margenX + col * (anchoBoleto + gap), margenY + fila * (altoBoleto + gap), anchoBoleto, altoBoleto);
+  });
+  doc.save(nombreArchivoFecha("boletos-completos-imprimibles"));
+  return true;
+}
+function ModalBoletosCompletos({ grupos, evento, onCerrar }) {
+  const [generando, setGenerando] = useState(null);
+  const [mensaje, setMensaje] = useState("");
+  const lista = gruposConBoletosCompletos(grupos);
+  const total = lista.reduce((s, x) => s + x.completos.length, 0);
+  const listo = typeof window.jspdf !== "undefined";
+  const ejecutar = async (cual) => {
+    if (!listo) {
+      setMensaje("No se pudo cargar el generador de PDF. Revisa tu conexi\xF3n y recarga la p\xE1gina.");
+      return;
+    }
+    setGenerando(cual);
+    setMensaje("");
+    try {
+      if (cual === "lista") descargarListaBoletosCompletos(grupos);
+      else await descargarBoletosImprimibles(grupos, evento);
+    } catch (e) {
+      console.error(e);
+      setMensaje("Ocurri\xF3 un error al generar el PDF. Intenta de nuevo.");
+    }
+    setGenerando(null);
+  };
+  const boton = (cual, texto, icono) => /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => ejecutar(cual),
+      disabled: !!generando || total === 0,
+      className: "w-full flex items-center justify-center gap-2 text-white font-body font-semibold py-3 rounded-xl transition-colors disabled:opacity-50",
+      style: { backgroundColor: "#5E1A8A" }
+    },
+    /* @__PURE__ */ React.createElement(icono, { className: "w-5 h-5" }),
+    generando === cual ? "Generando PDF…" : texto
+  );
+  return /* @__PURE__ */ React.createElement("div", {
+    className: "fixed inset-0 z-50 flex items-center justify-center p-4",
+    style: { backgroundColor: "rgba(30,20,45,0.55)" },
+    onClick: (e) => {
+      if (e.target === e.currentTarget && !generando) onCerrar();
+    }
+  }, /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow-2xl p-6 w-full max-w-sm relative" }, /* @__PURE__ */ React.createElement(
+    "button",
+    { onClick: onCerrar, disabled: !!generando, className: "absolute top-4 right-4 text-[#5E1A8A]/60", "aria-label": "Cerrar" },
+    /* @__PURE__ */ React.createElement(X, { className: "w-5 h-5" })
+  ), /* @__PURE__ */ React.createElement("h3", { className: "font-display text-xl text-[#5E1A8A] font-semibold mb-1" }, "Boletos completos"), /* @__PURE__ */ React.createElement("p", { className: "font-body text-sm text-[#5E1A8A]/70 mb-5" }, total === 0 ? "Todav\xEDa no hay boletos completamente pagados." : `${total} boleto(s) completamente pagado(s).`), /* @__PURE__ */ React.createElement("div", { className: "flex flex-col gap-3" }, boton("lista", "Descargar lista", Download), boton("boletos", "Descargar boletos", Ticket)), /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-[#5E1A8A]/60 mt-4" }, "Los boletos se acomodan 8 por hoja tama\xF1o carta, en dos columnas."), mensaje && /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-red-500 mt-2" }, mensaje)));
 }
 function TicketDescargable({ ticket, nombreGrupo, evento }) {
   const canvasRef = useRef(null);
@@ -1209,6 +1412,7 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
   const [filtro, setFiltro] = useState("");
   const [folioBuscado, setFolioBuscado] = useState("");
   const [mostrarImportar, setMostrarImportar] = useState(false);
+  const [mostrarBoletosCompletos, setMostrarBoletosCompletos] = useState(false);
   const todosTickets = grupos.flatMap((g) => g.tickets);
   const completos = todosTickets.filter(boletoCompleto).length;
   const enProceso = todosTickets.length - completos;
@@ -1312,7 +1516,16 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
     /* @__PURE__ */ React.createElement(t.icon, { className: "w-4 h-4" }),
     " ",
     t.label
-  ))), tab === "resumen" && /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 sm:gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Grupos (l\xEDderes)"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, grupos.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos totales"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, todosTickets.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos completos"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#CB924F] font-semibold" }, completos)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "En proceso"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, enProceso)), /* @__PURE__ */ React.createElement("div", { className: "col-span-2 bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Recaudado"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-3xl text-[#5E1A8A] font-semibold" }, "$", recaudado.toLocaleString("es-MX"), " MXN"))), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
+  ))), tab === "resumen" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-2 gap-3 sm:gap-4" }, /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Grupos (l\xEDderes)"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, grupos.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos totales"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, todosTickets.length)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Boletos completos"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#CB924F] font-semibold" }, completos)), /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "En proceso"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-4xl text-[#5E1A8A] font-semibold" }, enProceso)), /* @__PURE__ */ React.createElement("div", { className: "col-span-2 bg-white rounded-2xl shadow p-5" }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/70 text-sm" }, "Recaudado"), /* @__PURE__ */ React.createElement("p", { className: "font-display text-3xl text-[#5E1A8A] font-semibold" }, "$", recaudado.toLocaleString("es-MX"), " MXN"))), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => setMostrarBoletosCompletos(true),
+      className: "mt-4 w-full flex items-center justify-center gap-2 text-white font-body font-semibold py-3.5 rounded-2xl shadow transition-colors",
+      style: { backgroundColor: "#5E1A8A" }
+    },
+    /* @__PURE__ */ React.createElement(Ticket, { className: "w-5 h-5" }),
+    "Boletos completos"
+  ), mostrarBoletosCompletos && /* @__PURE__ */ React.createElement(ModalBoletosCompletos, { grupos, evento, onCerrar: () => setMostrarBoletosCompletos(false) })), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: descargarRespaldo,
