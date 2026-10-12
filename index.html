@@ -560,6 +560,116 @@ async function descargarBoletosImprimibles(grupos, evento) {
   doc.save(nombreArchivoFecha("boletos-completos-imprimibles"));
   return true;
 }
+function faltantePorPagar(t) {
+  return Math.max(0, TIPOS_BOLETO[t.tipo].total - montoPagado(t));
+}
+function gruposConBoletosIncompletos(grupos) {
+  return grupos.map((g) => ({
+    grupo: g,
+    lider: g.tickets[0],
+    incompletos: g.tickets.filter((t) => !boletoCompleto(t))
+  })).filter((x) => x.incompletos.length > 0).sort((a, b) => a.lider.nombre.localeCompare(b.lider.nombre, "es"));
+}
+function descargarListaBoletosIncompletos(grupos) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "mm", format: "letter" });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 16;
+  const sangria = 10;
+  const morado = [94, 26, 138];
+  const dorado = [203, 146, 79];
+  const gris = [130, 120, 140];
+  const rojo = [176, 58, 46];
+  const pesos = (n) => "$" + Math.round(n).toLocaleString("es-MX");
+  const lista = gruposConBoletosIncompletos(grupos);
+  const totalBoletos = lista.reduce((s, x) => s + x.incompletos.length, 0);
+  const totalFalta = lista.reduce((s, x) => s + x.incompletos.reduce((ss, t) => ss + faltantePorPagar(t), 0), 0);
+  let y = M;
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.setTextColor(...morado);
+  doc.text(`${EVENTO_NOMBRE} \xB7 Gala de Aniversario`, M, y + 4);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(11);
+  doc.setTextColor(...dorado);
+  doc.text("Boletos incompletos (pendientes de pago)", M, y + 10);
+  doc.setFontSize(9);
+  doc.setTextColor(...gris);
+  doc.text(`Generado el ${(/* @__PURE__ */ new Date()).toLocaleDateString("es-MX")} \xB7 ${totalBoletos} boleto(s) incompleto(s) \xB7 Falta por cobrar: ${pesos(totalFalta)} MXN`, M, y + 15);
+  doc.setDrawColor(...dorado);
+  doc.setLineWidth(0.4);
+  doc.line(M, y + 18, W - M, y + 18);
+  y += 26;
+  const asegurarEspacio = (alto) => {
+    if (y + alto > H - M) {
+      doc.addPage();
+      y = M;
+    }
+  };
+  const recortar = (texto, ancho) => {
+    const partes = doc.splitTextToSize(texto, ancho);
+    return partes[0] + (partes.length > 1 ? "…" : "");
+  };
+  const detalle = (t) => `Pagado ${pesos(montoPagado(t))} de ${pesos(TIPOS_BOLETO[t.tipo].total)} \xB7 ${sellosCompletados(t)}/${totalSellos(t)} sellos`;
+  if (lista.length === 0) {
+    doc.setFontSize(11);
+    doc.setTextColor(...gris);
+    doc.text("No hay boletos incompletos: todos est\xE1n pagados.", M, y);
+  }
+  lista.forEach(({ grupo, lider, incompletos }) => {
+    const acompanantes = incompletos.filter((t) => !t.esLider);
+    const liderPendiente = !boletoCompleto(lider);
+    asegurarEspacio(liderPendiente ? 14 : 10);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(...(liderPendiente ? morado : gris));
+    doc.text(recortar(lider.nombre, W - 2 * M - 60), M, y);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(...gris);
+    const cel = grupo.celular ? `Cel. ${grupo.celular}` : "Sin celular";
+    doc.text(liderPendiente ? `${cel} \xB7 ${detalle(lider)}` : `${cel} \xB7 su boleto ya est\xE1 pagado (${lider.folio || "sin folio"})`, M, y + 4.5);
+    if (liderPendiente) {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(...rojo);
+      doc.text(`Falta ${pesos(faltantePorPagar(lider))}`, W - M, y, { align: "right" });
+    }
+    y += 10;
+    acompanantes.forEach((t) => {
+      asegurarEspacio(10);
+      doc.setDrawColor(...dorado);
+      doc.setLineWidth(0.3);
+      doc.line(M + 3, y - 4.6, M + 3, y - 1.2);
+      doc.line(M + 3, y - 1.2, M + sangria - 2, y - 1.2);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(40, 30, 50);
+      doc.text(recortar(t.nombre, W - 2 * M - sangria - 40), M + sangria, y);
+      doc.setFontSize(8.5);
+      doc.setTextColor(...gris);
+      doc.text(detalle(t), M + sangria, y + 4);
+      doc.setFontSize(10);
+      doc.setTextColor(...rojo);
+      doc.text(`Falta ${pesos(faltantePorPagar(t))}`, W - M, y, { align: "right" });
+      y += 9;
+    });
+    doc.setDrawColor(235, 228, 242);
+    doc.setLineWidth(0.2);
+    doc.line(M, y - 3, W - M, y - 3);
+    y += 2;
+  });
+  const paginas = doc.internal.getNumberOfPages();
+  for (let p = 1; p <= paginas; p++) {
+    doc.setPage(p);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(...gris);
+    doc.text(`P\xE1gina ${p} de ${paginas}`, W - M, H - 8, { align: "right" });
+  }
+  doc.save(nombreArchivoFecha("boletos-incompletos"));
+}
 function ModalBoletosCompletos({ grupos, evento, onCerrar }) {
   const [generando, setGenerando] = useState(null);
   const [mensaje, setMensaje] = useState("");
@@ -1525,6 +1635,26 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
     },
     /* @__PURE__ */ React.createElement(Ticket, { className: "w-5 h-5" }),
     "Boletos completos"
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        if (typeof window.jspdf === "undefined") {
+          alert("No se pudo cargar el generador de PDF. Revisa tu conexi\xF3n y recarga la p\xE1gina.");
+          return;
+        }
+        try {
+          descargarListaBoletosIncompletos(grupos);
+        } catch (e) {
+          console.error(e);
+          alert("Ocurri\xF3 un error al generar el PDF. Intenta de nuevo.");
+        }
+      },
+      className: "mt-3 w-full flex items-center justify-center gap-2 font-body font-semibold py-3.5 rounded-2xl shadow transition-colors bg-white border-2",
+      style: { borderColor: "#5E1A8A", color: "#5E1A8A" }
+    },
+    /* @__PURE__ */ React.createElement(Download, { className: "w-5 h-5" }),
+    "Boletos incompletos"
   ), mostrarBoletosCompletos && /* @__PURE__ */ React.createElement(ModalBoletosCompletos, { grupos, evento, onCerrar: () => setMostrarBoletosCompletos(false) })), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
     "button",
     {
