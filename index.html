@@ -1018,6 +1018,279 @@ function AbonosAdmin({ ticket, onAgregarAbono, onEditarAbono, config }) {
     "Agregar"
   )));
 }
+const MESES_CORTOS = { ene: 1, feb: 2, mar: 3, abr: 4, may: 5, jun: 6, jul: 7, ago: 8, sep: 9, set: 9, oct: 10, nov: 11, dic: 12 };
+function quitarCodigosNombre(s) {
+  return String(s || "").replace(/\(\s*\d+\s*\)/g, " ").replace(/\bMW\s*\d+\b/gi, " ").replace(/\s+/g, " ").trim();
+}
+function claveNombre(s) {
+  return quitarCodigosNombre(s).normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase().replace(/[^A-Z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+function parsearMontoHistorico(raw) {
+  let s = String(raw || "").replace(/[$\s]/g, "");
+  if (!s) return NaN;
+  const ultimaComa = s.lastIndexOf(",");
+  const ultimoPunto = s.lastIndexOf(".");
+  if (ultimaComa > ultimoPunto) s = s.replace(/\./g, "").replace(",", ".");
+  else s = s.replace(/,/g, "");
+  return Math.round(Number(s) * 100) / 100;
+}
+function parsearFechaHistorico(raw, anio) {
+  const s = String(raw || "").trim().toLowerCase();
+  let m = s.match(/^(\d{1,2})[-\/ ]([a-z]{3})/);
+  if (m && MESES_CORTOS[m[2]]) return `${anio}-${String(MESES_CORTOS[m[2]]).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return s;
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  return null;
+}
+function decodificarTextoArchivo(buffer) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  } catch (e) {
+    return new TextDecoder("windows-1252").decode(buffer);
+  }
+}
+// Lee las columnas NOMBRE;MONTO;FECHA del histórico (las demás columnas son un resumen y se ignoran).
+function parsearHistoricoCsv(texto, anio) {
+  const lineas = texto.replace(/^﻿/, "").split(/\r?\n/);
+  const sep = (lineas[0] || "").split(";").length >= (lineas[0] || "").split(",").length ? ";" : ",";
+  const pagos = [];
+  const errores = [];
+  lineas.forEach((linea, i) => {
+    if (i === 0) return;
+    const cols = linea.split(sep);
+    const nombreOriginal = (cols[0] || "").trim();
+    if (!nombreOriginal && !(cols[1] || "").trim()) return;
+    const monto = parsearMontoHistorico(cols[1]);
+    const fecha = parsearFechaHistorico(cols[2], anio);
+    if (!nombreOriginal || !(monto > 0) || !fecha) {
+      errores.push(`Fila ${i + 1}: "${linea.slice(0, 60)}"`);
+      return;
+    }
+    pagos.push({ fila: i + 1, nombreOriginal, nombre: quitarCodigosNombre(nombreOriginal), clave: claveNombre(nombreOriginal), monto, fecha });
+  });
+  pagos.sort((a, b) => a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : a.fila - b.fila);
+  return { pagos, errores };
+}
+function aplicarAbonoBoleto(t, monto, fecha, folio) {
+  const def = TIPOS_BOLETO[t.tipo];
+  t.pagos = distribuirAbono(t.pagos, def.montoPago, monto, fecha, folio).map((p) => {
+    const montoAcumulado = Math.round((p.montoAcumulado || 0) * 100) / 100;
+    if (!p.pagado && montoAcumulado >= def.montoPago - 5e-3) return { ...p, montoAcumulado: def.montoPago, pagado: true, fecha, folio };
+    return { ...p, montoAcumulado };
+  });
+  t.historialAbonos = [...t.historialAbonos || [], { monto, fecha, folio }];
+}
+function capacidadBoleto(t) {
+  return Math.round((TIPOS_BOLETO[t.tipo].total - montoPagado(t)) * 100) / 100;
+}
+// Arma (sin guardar nada) el resultado de reemplazar los pagos con los del histórico.
+function planearImportacionHistorico(grupos, pagos, folioPagoInicio) {
+  const gruposMap = new Map(grupos.map((g) => [g.id, JSON.parse(JSON.stringify(g))]));
+  const porLider = new Map();
+  const porAcomp = new Map();
+  const duplicados = /* @__PURE__ */ new Set();
+  for (const g of gruposMap.values()) {
+    g.tickets.forEach((t) => {
+      const k = claveNombre(t.nombre);
+      if (!k) return;
+      const mapa = t.esLider ? porLider : porAcomp;
+      if (mapa.has(k)) duplicados.add(t.nombre);
+      else mapa.set(k, { gid: g.id, tid: t.id });
+    });
+  }
+  const celulares = new Set([...gruposMap.values()].map((g) => g.celular));
+  let siguiente666 = 1;
+  const nuevoCelular666 = () => {
+    let cel;
+    do {
+      cel = "666" + String(siguiente666++).padStart(7, "0");
+    } while (celulares.has(cel));
+    celulares.add(cel);
+    return cel;
+  };
+  const pagadorPorClave = new Map();
+  const nuevas = [];
+  const coincidencias = [];
+  pagos.forEach((p) => {
+    if (pagadorPorClave.has(p.clave)) return;
+    let ref = porLider.get(p.clave) || porAcomp.get(p.clave);
+    if (ref) {
+      const g = gruposMap.get(ref.gid);
+      const t = g.tickets.find((x) => x.id === ref.tid);
+      coincidencias.push({ archivo: p.nombreOriginal, pagina: t.nombre, celular: g.celular, comoAcompanante: !t.esLider });
+    } else {
+      const g = crearGrupo(p.nombre, nuevoCelular666(), "abono_mayoreo");
+      gruposMap.set(g.id, g);
+      ref = { gid: g.id, tid: g.tickets[0].id };
+      nuevas.push({ nombre: p.nombre, celular: g.celular });
+    }
+    pagadorPorClave.set(p.clave, ref);
+  });
+  const gruposTocados = new Set([...pagadorPorClave.values()].map((r) => r.gid));
+  const ticketsPagadores = new Set([...pagadorPorClave.values()].map((r) => r.tid));
+  gruposTocados.forEach((gid) => {
+    gruposMap.get(gid).tickets.forEach((t) => {
+      t.pagos = Array(TIPOS_BOLETO[t.tipo].numPagos).fill(null).map(() => ({ pagado: false, fecha: null, folio: null, montoAcumulado: 0 }));
+      t.historialAbonos = [];
+      t.folio = null;
+    });
+  });
+  const acompCreados = [];
+  let folioPago = folioPagoInicio;
+  pagos.forEach((p) => {
+    const ref = pagadorPorClave.get(p.clave);
+    const g = gruposMap.get(ref.gid);
+    const propio = g.tickets.find((t) => t.id === ref.tid);
+    const folio = `PAGO-${String(++folioPago).padStart(5, "0")}`;
+    let restante = p.monto;
+    const destinos = () => [propio, ...g.tickets.filter((t) => t !== propio && !ticketsPagadores.has(t.id))];
+    let guard = 0;
+    while (restante > 5e-3 && guard++ < 50) {
+      const t = destinos().find((x) => capacidadBoleto(x) > 5e-3);
+      if (!t) {
+        const lider = g.tickets[0];
+        const n = g.tickets.filter((x) => !x.esLider).length + 1;
+        const nuevo = crearBoleto(`Acompa\xF1ante ${n} de ${lider.nombre}`, lider.tipo, false);
+        nuevo.id += "_" + n;
+        g.tickets.push(nuevo);
+        acompCreados.push({ nombre: nuevo.nombre, celular: g.celular });
+        continue;
+      }
+      const porcion = Math.min(restante, capacidadBoleto(t));
+      aplicarAbonoBoleto(t, Math.round(porcion * 100) / 100, p.fecha, folio);
+      restante = Math.round((restante - porcion) * 100) / 100;
+    }
+  });
+  const completos = [];
+  for (const g of gruposMap.values()) {
+    g.tickets.forEach((t, idx) => {
+      if (boletoCompleto(t)) {
+        const fechaFin = t.pagos.map((p) => p.fecha || "").sort().pop();
+        completos.push({ t, fechaFin, lider: g.tickets[0].nombre, idx });
+      } else {
+        t.folio = null;
+      }
+    });
+  }
+  completos.sort((a, b) => a.fechaFin < b.fechaFin ? -1 : a.fechaFin > b.fechaFin ? 1 : a.lider.localeCompare(b.lider, "es") || a.idx - b.idx);
+  completos.forEach((c, i) => {
+    c.t.folio = `GALA-${String(i + 1).padStart(4, "0")}`;
+  });
+  const originales = new Map(grupos.map((g) => [g.id, JSON.stringify(g)]));
+  const cambiados = [...gruposMap.values()].filter((g) => originales.get(g.id) !== JSON.stringify(g));
+  return {
+    gruposMap,
+    cambiados,
+    nuevas,
+    coincidencias,
+    acompCreados,
+    duplicados: [...duplicados],
+    totalPagos: pagos.length,
+    totalMonto: Math.round(pagos.reduce((s, p) => s + p.monto, 0) * 100) / 100,
+    personasArchivo: pagadorPorClave.size,
+    gruposSinCambio: grupos.filter((g) => !gruposTocados.has(g.id)).length,
+    boletosCompletos: completos.length,
+    folioContador: completos.length,
+    folioPagoContador: folioPago
+  };
+}
+function ImportarHistoricoCsv({ grupos, guardarGrupo, onCerrar }) {
+  const [archivo, setArchivo] = useState(null);
+  const [anio, setAnio] = useState(String((/* @__PURE__ */ new Date()).getFullYear()));
+  const [cargando, setCargando] = useState(false);
+  const [error, setError] = useState("");
+  const [plan, setPlan] = useState(null);
+  const [errores, setErrores] = useState([]);
+  const [resultado, setResultado] = useState(null);
+  const pesos = (n) => "$" + n.toLocaleString("es-MX", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const analizar = async () => {
+    setError("");
+    setPlan(null);
+    setResultado(null);
+    if (!archivo) {
+      setError("Selecciona el archivo CSV.");
+      return;
+    }
+    setCargando(true);
+    try {
+      const texto = decodificarTextoArchivo(await archivo.arrayBuffer());
+      const { pagos, errores: errs } = parsearHistoricoCsv(texto, Number(anio) || (/* @__PURE__ */ new Date()).getFullYear());
+      if (pagos.length === 0) throw new Error("No encontr\xE9 pagos. El archivo debe tener las columnas NOMBRE;MONTO;FECHA.");
+      const contadores = await db.collection("mwGalaConfig").doc("contadores").get();
+      const inicio = contadores.exists ? contadores.data().folioPagoContador || 0 : 0;
+      setErrores(errs);
+      setPlan(planearImportacionHistorico(grupos, pagos, inicio));
+    } catch (e) {
+      setError(e.message || "No pude leer el archivo.");
+    }
+    setCargando(false);
+  };
+  const confirmar = async () => {
+    if (!plan) return;
+    setCargando(true);
+    try {
+      for (const g of plan.cambiados) await guardarGrupo(g);
+      await db.collection("mwGalaConfig").doc("contadores").set(
+        { folioContador: plan.folioContador, folioPagoContador: plan.folioPagoContador },
+        { merge: true }
+      );
+      setResultado(plan);
+      setPlan(null);
+    } catch (e) {
+      setError("Ocurri\xF3 un error al guardar. Revisa tu conexi\xF3n e intenta de nuevo.");
+    }
+    setCargando(false);
+  };
+  const caja = (titulo, valor) => /* @__PURE__ */ React.createElement("div", { className: "rounded-lg p-2", style: { backgroundColor: "#F8F4EF" } }, /* @__PURE__ */ React.createElement("p", { className: "font-display text-xl text-[#5E1A8A] font-semibold" }, valor), /* @__PURE__ */ React.createElement("p", { className: "font-body text-[11px] text-[#5E1A8A]/70" }, titulo));
+  const listaDetalle = (titulo, items) => items.length > 0 && /* @__PURE__ */ React.createElement("details", { className: "mb-2" }, /* @__PURE__ */ React.createElement("summary", { className: "font-body text-sm text-[#5E1A8A] cursor-pointer" }, titulo, " (", items.length, ")"), /* @__PURE__ */ React.createElement("ul", { className: "font-body text-xs text-[#5E1A8A]/80 mt-1 ml-4 list-disc max-h-48 overflow-y-auto" }, items.map((x, i) => /* @__PURE__ */ React.createElement("li", { key: i }, x))));
+  return /* @__PURE__ */ React.createElement("div", { className: "bg-white rounded-2xl shadow p-5 mb-4" }, /* @__PURE__ */ React.createElement("div", { className: "flex items-center justify-between mb-3" }, /* @__PURE__ */ React.createElement("p", { className: "font-body font-medium text-[#5E1A8A]" }, "Importar hist\xF3rico de pagos (CSV)"), /* @__PURE__ */ React.createElement("button", { onClick: onCerrar, className: "text-[#5E1A8A]/60", "aria-label": "Cerrar" }, /* @__PURE__ */ React.createElement(X, { className: "w-5 h-5" }))), /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-[#5E1A8A]/70 mb-3" }, "Usa las columnas NOMBRE;MONTO;FECHA. A cada persona del archivo se le borran sus pagos y se cargan los del archivo (primero su boleto y luego el de sus acompa\xF1antes). Quien no exista se crea con un celular que empieza con 666. Quien no venga en el archivo se queda igual. Los folios de boleto se renumeran. Te recomiendo descargar un respaldo antes."), /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap items-center gap-3 mb-3" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "file",
+      accept: ".csv,text/csv",
+      onChange: (e) => {
+        setArchivo(e.target.files[0] || null);
+        setPlan(null);
+      },
+      className: "font-body text-sm text-[#5E1A8A]"
+    }
+  ), /* @__PURE__ */ React.createElement("label", { className: "font-body text-xs text-[#5E1A8A]/70 flex items-center gap-1" }, "A\xF1o de las fechas", /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: anio,
+      onChange: (e) => setAnio(e.target.value.replace(/\D/g, "").slice(0, 4)),
+      className: "w-16 font-body text-sm border border-[#E5DFD5] rounded-lg px-2 py-1"
+    }
+  ))), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: analizar,
+      disabled: cargando,
+      className: "w-full text-white rounded-xl py-2.5 font-body font-medium disabled:opacity-50",
+      style: { backgroundColor: "#5E1A8A" }
+    },
+    cargando && !plan ? "Leyendo…" : "Analizar"
+  ), error && /* @__PURE__ */ React.createElement("p", { className: "font-body text-xs text-red-500 mt-2" }, error), plan && /* @__PURE__ */ React.createElement("div", { className: "mt-4" }, /* @__PURE__ */ React.createElement("div", { className: "grid grid-cols-3 gap-2 mb-3 text-center" }, caja("pagos", plan.totalPagos), caja("personas en el archivo", plan.personasArchivo), caja("nuevas (666)", plan.nuevas.length), caja("acompa\xF1antes a crear", plan.acompCreados.length), caja("boletos completos", plan.boletosCompletos), caja("sin cambios", plan.gruposSinCambio)), /* @__PURE__ */ React.createElement("p", { className: "font-body text-sm text-[#5E1A8A] mb-2" }, "Total del archivo: ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, pesos(plan.totalMonto))), listaDetalle("Personas nuevas", plan.nuevas.map((x) => `${x.nombre} \xB7 ${x.celular}`)), listaDetalle("Encontradas en la p\xE1gina", plan.coincidencias.map((x) => `${x.archivo} → ${x.pagina} \xB7 ${x.celular}${x.comoAcompanante ? " (acompa\xF1ante)" : ""}`)), listaDetalle("Acompa\xF1antes que se crear\xE1n", plan.acompCreados.map((x) => `${x.nombre} \xB7 ${x.celular}`)), listaDetalle("Nombres repetidos en la p\xE1gina (se us\xF3 el primero)", plan.duplicados), listaDetalle("Filas del archivo que no se pudieron leer", errores), /* @__PURE__ */ React.createElement("div", { className: "flex gap-2 mt-3" }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: confirmar,
+      disabled: cargando,
+      className: "flex-1 text-white rounded-xl py-2.5 font-body font-medium disabled:opacity-50",
+      style: { backgroundColor: "#5E1A8A" }
+    },
+    cargando ? "Guardando…" : "S\xED, reemplazar pagos"
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => setPlan(null),
+      disabled: cargando,
+      className: "px-4 rounded-xl border border-[#5E1A8A]/30 text-[#5E1A8A] font-body text-sm"
+    },
+    "Cancelar"
+  ))), resultado && /* @__PURE__ */ React.createElement("div", { className: "rounded-xl p-4 text-center mt-4", style: { backgroundColor: "#F8F4EF" } }, /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]" }, "Listo: se cargaron ", /* @__PURE__ */ React.createElement("span", { className: "font-semibold" }, resultado.totalPagos), " pagos (", pesos(resultado.totalMonto), "), ", resultado.nuevas.length, " personas nuevas y ", resultado.boletosCompletos, " boletos completos.")));
+}
 function ImportarGoogleSheets({ grupos, guardarGrupo, config, guardarSheetsUrls, onCerrar }) {
   const urlsGuardadas = config.sheetsUrls || {};
   const [modo, setModo] = useState("links");
@@ -1522,6 +1795,7 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
   const [filtro, setFiltro] = useState("");
   const [folioBuscado, setFolioBuscado] = useState("");
   const [mostrarImportar, setMostrarImportar] = useState(false);
+  const [mostrarHistorico, setMostrarHistorico] = useState(false);
   const [mostrarBoletosCompletos, setMostrarBoletosCompletos] = useState(false);
   const todosTickets = grupos.flatMap((g) => g.tickets);
   const completos = todosTickets.filter(boletoCompleto).length;
@@ -1655,7 +1929,7 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
     },
     /* @__PURE__ */ React.createElement(Download, { className: "w-5 h-5" }),
     "Boletos incompletos"
-  ), mostrarBoletosCompletos && /* @__PURE__ */ React.createElement(ModalBoletosCompletos, { grupos, evento, onCerrar: () => setMostrarBoletosCompletos(false) })), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex justify-end gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
+  ), mostrarBoletosCompletos && /* @__PURE__ */ React.createElement(ModalBoletosCompletos, { grupos, evento, onCerrar: () => setMostrarBoletosCompletos(false) })), tab === "lideres" && /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "flex flex-wrap justify-end gap-2 mb-3" }, /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: descargarRespaldo,
@@ -1669,7 +1943,14 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
       className: "font-body text-sm text-[#5E1A8A] border border-[#5E1A8A]/30 rounded-full px-4 py-1.5"
     },
     mostrarImportar ? "Ocultar importador" : "\u{1F4E5} Importar l\xEDderes/pagos"
-  )), mostrarImportar && /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => setMostrarHistorico(!mostrarHistorico),
+      className: "font-body text-sm text-[#5E1A8A] border border-[#5E1A8A]/30 rounded-full px-4 py-1.5"
+    },
+    mostrarHistorico ? "Ocultar hist\xF3rico" : "\u{1F5C2}\uFE0F Importar hist\xF3rico (CSV)"
+  )), mostrarHistorico && /* @__PURE__ */ React.createElement(ImportarHistoricoCsv, { grupos, guardarGrupo, onCerrar: () => setMostrarHistorico(false) }), mostrarImportar && /* @__PURE__ */ React.createElement(
     ImportarGoogleSheets,
     {
       grupos,
