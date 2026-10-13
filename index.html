@@ -1819,6 +1819,7 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
   const [mostrarImportar, setMostrarImportar] = useState(false);
   const [mostrarHistorico, setMostrarHistorico] = useState(false);
   const [soloFueraHistorico, setSoloFueraHistorico] = useState(false);
+  const [solo666, setSolo666] = useState(false);
   const [mostrarBoletosCompletos, setMostrarBoletosCompletos] = useState(false);
   const todosTickets = grupos.flatMap((g) => g.tickets);
   const completos = todosTickets.filter(boletoCompleto).length;
@@ -1831,8 +1832,9 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
     setNuevoCelular("");
   };
   const totalFueraHistorico = grupos.filter((g) => g.fueraHistorico).length;
+  const total666 = grupos.filter((g) => String(g.celular || "").startsWith("666")).length;
   const gruposFiltrados = grupos.filter(
-    (g) => (g.tickets[0].nombre.toLowerCase().includes(filtro.toLowerCase()) || g.celular.includes(filtro)) && (!soloFueraHistorico || g.fueraHistorico)
+    (g) => (g.tickets[0].nombre.toLowerCase().includes(filtro.toLowerCase()) || g.celular.includes(filtro)) && (!soloFueraHistorico || g.fueraHistorico) && (!solo666 || String(g.celular || "").startsWith("666"))
   );
   const ticketEncontrado = folioBuscado.trim() ? todosTickets.find(
     (t) => t.folio && t.folio.toLowerCase() === folioBuscado.trim().toLowerCase()
@@ -2024,7 +2026,14 @@ function VistaEquipo({ config, guardarEvento, guardarPeriodos, guardarSheetsUrls
       checked: soloFueraHistorico,
       onChange: (e) => setSoloFueraHistorico(e.target.checked)
     }
-  ), "Ver solo las que no est\xE1n en el hist\xF3rico (", totalFueraHistorico, ")"), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, gruposFiltrados.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/60 text-center py-8" }, "No hay l\xEDderes registradas todav\xEDa."), gruposFiltrados.map((g) => /* @__PURE__ */ React.createElement(
+  ), "Ver solo las que no est\xE1n en el hist\xF3rico (", totalFueraHistorico, ")"), (total666 > 0 || solo666) && /* @__PURE__ */ React.createElement("label", { className: "flex items-center gap-2 font-body text-sm text-[#5E1A8A] mb-4 -mt-2" }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "checkbox",
+      checked: solo666,
+      onChange: (e) => setSolo666(e.target.checked)
+    }
+  ), "Ver solo las de celular 666 (", total666, ")"), /* @__PURE__ */ React.createElement("div", { className: "space-y-3" }, gruposFiltrados.length === 0 && /* @__PURE__ */ React.createElement("p", { className: "font-body text-[#5E1A8A]/60 text-center py-8" }, "No hay l\xEDderes registradas todav\xEDa."), gruposFiltrados.map((g) => /* @__PURE__ */ React.createElement(
     TarjetaGrupoAdmin,
     {
       key: g.id,
